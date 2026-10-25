@@ -1,75 +1,70 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -uo pipefail
 
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 LLAMA_CPP_DIR="/e/llama.cpp"
 BENCH="$LLAMA_CPP_DIR/build/bin/Release/llama-bench.exe"
-MODEL="$PROJECT_DIR/models/gguf/Qwen_Qwen3-1.7B-Q4_K_M.gguf"
+MODELS_DIR="$PROJECT_DIR/models"
 
-RESULTS_DIR="$PROJECT_DIR/results"
-TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-LOG="$RESULTS_DIR/benchmark_BASELINE_$TIMESTAMP.log"
+declare -A MODEL_FILE=(
+  [bf16]="$MODELS_DIR/qwen3-1.7b-bf16.gguf"
+  [q8]="$MODELS_DIR/qwen3-1.7b-q8_0.gguf"
+)
+# Max depth that can plausibly fit in 6 GB; the deepest point documents the limit.
+declare -A DEPTHS=(
+  [bf16]="0 512 1024 2048 4096 8192 16384 24576"
+  [q8]="0 512 1024 2048 4096 8192 16384 24576 32768"
+)
 
-CLI="/e/llama.cpp/build/bin/Release/llama-cli.exe"
+SELECTED=("$@"); [[ ${#SELECTED[@]} -eq 0 ]] && SELECTED=(bf16 q8)
 
-mkdir -p "$RESULTS_DIR"
+TS=$(date +%Y%m%d_%H%M%S)
+OUT="$PROJECT_DIR/results/baseline_$TS"
+mkdir -p "$OUT"
 
-if [[ ! -f "$BENCH" ]]; then
-    echo "Error: Benchmark executable not found at $BENCH"
-    exit 1
-fi
+[[ -f "$BENCH" ]] || { echo "missing $BENCH"; exit 1; }
+for k in "${SELECTED[@]}"; do
+  [[ -n "${MODEL_FILE[$k]:-}" ]] || { echo "unknown model key: $k (use bf16/q8)"; exit 1; }
+  [[ -f "${MODEL_FILE[$k]}" ]] || { echo "missing ${MODEL_FILE[$k]}"; exit 1; }
+done
 
-if [[ ! -f "$MODEL" ]]; then
-    echo "Error: Model file not found at $MODEL"
-    exit 1
-fi
+# --- environment record ---
+{
+  date
+  nvidia-smi
+  nvidia-smi --query-gpu=name,driver_version,clocks.max.sm,clocks.max.mem,memory.total,power.limit --format=csv
+  echo "llama.cpp: $(git -C "$LLAMA_CPP_DIR" rev-parse HEAD)"
+  echo "sysmem fallback policy: <set manually: Prefer No Sysmem Fallback>"
+  for k in "${SELECTED[@]}"; do sha256sum "${MODEL_FILE[$k]}"; done
+} > "$OUT/env.txt" 2>&1
 
-run_benchmark(){
-    echo "Command: $*"
-    "$@" 2>&1
+# --- background GPU telemetry (1 Hz) ---
+nvidia-smi --query-gpu=timestamp,utilization.gpu,clocks.sm,clocks.mem,power.draw,temperature.gpu,memory.used \
+  --format=csv -l 1 > "$OUT/gpu_telemetry.csv" 2>/dev/null &
+TELEM_PID=$!
+trap 'kill $TELEM_PID 2>/dev/null' EXIT
+
+run() {  # tag, name, args...
+  local tag=$1 name=$2; shift 2
+  echo ">> $tag $name $*"
+  "$BENCH" -m "${MODEL_FILE[$tag]}" -ngl 99 -o jsonl "$@" \
+      >> "$OUT/${tag}_${name}.jsonl" 2>> "$OUT/${tag}_${name}.stderr" \
+    || echo "FAILED: $tag $name $*" | tee -a "$OUT/failures.txt"
 }
 
-{
-    echo "LLM Inference Benchmark Baseline(llama.cpp) - $(date)"
-    echo "Model: $MODEL"
-    echo "Runtime: $BENCH"
-    
-    echo "Prefill benchmark..."
-    for prompt_tokens in 1 2 4 8 16 32 64 128 512 1024 2048 4096 8132 16264 32768; do
-        run_benchmark "$BENCH" -m "$MODEL" -ngl 99 -p "$prompt_tokens" \
-            -n 0 -r 3
+for tag in "${SELECTED[@]}"; do
+  # Prefill, small batches: short runs are noisy -> many reps
+  run "$tag" prefill -p 1,4,16,64,128,256 -n 0 -fa 0,1 -r 20
+  # Prefill, large batches: compute-bound regime
+  run "$tag" prefill -p 512,1024,2048,4096 -n 0 -fa 0,1 -r 5
+
+  # Decode vs depth: one invocation per point so an OOM can't kill later runs
+  for fa in 0 1; do
+    for d in ${DEPTHS[$tag]}; do
+      run "$tag" decode_depth -p 0 -n 128 -fa "$fa" -d "$d" -r 5
     done
+  done
+done
 
-    echo "Decode context sweep"
-    # # n is held constant to isolate the effect of p
-    for p in 1 2 4 8 16 32 64 128 512 1024 2048; do
-        run_benchmark "$BENCH" -m "$MODEL" -ngl 99 -p "$p" \
-            -n 128 -r 3
-    done
-
-    echo "Generation length sweep"
-    # # p is held constant to isolate the effect of n
-    for n in 1 2 4 8 16 32 64 128 512 1024 2048 4096 8132 16264 32768; do
-        echo "Prompt: 512; generation: $n"
-        run_benchmark "$BENCH" -m "$MODEL" -ngl 99 -p 512 \
-            -n "$n" -r 3
-    done
-
-    for d in 0 1 2 4  8 16 32 64 128 512 1024 2048 4096 8192 16384 32768; do
-        run_benchmark "$BENCH" \
-            -m "$MODEL" -ngl 99 -p 1 -n 128 -d "$d" -r 5
-    done
-
-    # for ctx in 4096 8192 16384 32768 36864 40960; do
-    #     echo "Testing context: $ctx"
-    #     if ! "$CLI" -m "$MODEL" -ngl 99 -c "$ctx" \
-    #         -p "Test" -n 128 -st; then
-    #         echo "Failed at context $ctx"
-    #         break
-    #     fi
-    # done
-
-    echo "Benchmark completed at $(date)"
-} 2>&1 | tee "$LOG"
-
-echo "Benchmark results saved to $LOG"
+echo "done -> $OUT"
+[[ -f "$OUT/failures.txt" ]] && { echo "failures:"; cat "$OUT/failures.txt"; }
