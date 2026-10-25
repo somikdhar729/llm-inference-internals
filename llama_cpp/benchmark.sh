@@ -10,6 +10,8 @@ RESULTS_DIR="$PROJECT_DIR/results"
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 LOG="$RESULTS_DIR/benchmark_BASELINE_$TIMESTAMP.log"
 
+CLI="/e/llama.cpp/build/bin/Release/llama-cli.exe"
+
 mkdir -p "$RESULTS_DIR"
 
 if [[ ! -f "$BENCH" ]]; then
@@ -33,25 +35,39 @@ run_benchmark(){
     echo "Runtime: $BENCH"
     
     echo "Prefill benchmark..."
-    for prompt_tokens in 1 2 4 8 16 32 64 128 512 1024 2048; do
+    for prompt_tokens in 1 2 4 8 16 32 64 128 512 1024 2048 4096 8132 16264 32768; do
         run_benchmark "$BENCH" -m "$MODEL" -ngl 99 -p "$prompt_tokens" \
             -n 0 -r 3
     done
 
     echo "Decode context sweep"
-    # n is held constant to isolate the effect of p
+    # # n is held constant to isolate the effect of p
     for p in 1 2 4 8 16 32 64 128 512 1024 2048; do
         run_benchmark "$BENCH" -m "$MODEL" -ngl 99 -p "$p" \
             -n 128 -r 3
     done
 
     echo "Generation length sweep"
-    # p is held constant to isolate the effect of n
-    for n in 1 2 4 8 16 32 64 128 512 1024 2048; do
+    # # p is held constant to isolate the effect of n
+    for n in 1 2 4 8 16 32 64 128 512 1024 2048 4096 8132 16264 32768; do
         echo "Prompt: 512; generation: $n"
         run_benchmark "$BENCH" -m "$MODEL" -ngl 99 -p 512 \
             -n "$n" -r 3
     done
+
+    for d in 0 1 2 4  8 16 32 64 128 512 1024 2048 4096 8192 16384 32768; do
+        run_benchmark "$BENCH" \
+            -m "$MODEL" -ngl 99 -p 1 -n 128 -d "$d" -r 5
+    done
+
+    # for ctx in 4096 8192 16384 32768 36864 40960; do
+    #     echo "Testing context: $ctx"
+    #     if ! "$CLI" -m "$MODEL" -ngl 99 -c "$ctx" \
+    #         -p "Test" -n 128 -st; then
+    #         echo "Failed at context $ctx"
+    #         break
+    #     fi
+    # done
 
     echo "Benchmark completed at $(date)"
 } 2>&1 | tee "$LOG"
